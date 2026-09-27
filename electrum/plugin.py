@@ -543,6 +543,16 @@ class Plugins(DaemonThread):
                 manifest['zip_hash_sha256'] = sha256(blob).hex()
                 return manifest
 
+    @staticmethod
+    def _is_version_compatible(d: dict) -> bool:
+        min_version = d.get('min_electrum_version')
+        if min_version and StrictVersion(min_version) > StrictVersion(ELECTRUM_VERSION):
+            return False
+        max_version = d.get('max_electrum_version')
+        if max_version and StrictVersion(max_version) < StrictVersion(ELECTRUM_VERSION):
+            return False
+        return True
+
     def zip_plugin_path(self, name) -> str:
         path = self.get_metadata(name)['path']
         filename = os.path.basename(path)
@@ -571,13 +581,8 @@ class Plugins(DaemonThread):
                 continue
             if self.cmd_only and not self.config.get(f'plugins.{name}.enabled'):
                 continue
-            min_version = d.get('min_electrum_version')
-            if min_version and StrictVersion(min_version) > StrictVersion(ELECTRUM_VERSION):
-                self.logger.info(f"version mismatch for zip plugin {filename}", exc_info=True)
-                continue
-            max_version = d.get('max_electrum_version')
-            if max_version and StrictVersion(max_version) < StrictVersion(ELECTRUM_VERSION):
-                self.logger.info(f"version mismatch for zip plugin {filename}", exc_info=True)
+            if not self._is_version_compatible(d):
+                self.logger.info(f"version mismatch for zip plugin {filename}")
                 continue
 
             if not self.cmd_only:
@@ -751,14 +756,43 @@ class Plugins(DaemonThread):
             verified = False
         return verified
 
-    def authorize_plugin(self, name: str, privkey: ECPrivkey):
+    def _sign_plugin_hash(self, name: str, privkey: ECPrivkey) -> None:
         pubkey_bytes, salt = self.get_pubkey_bytes()
         assert pubkey_bytes == privkey.get_public_key_bytes()
         plugin_hash = bytes.fromhex(self.get_metadata(name)['zip_hash_sha256'])
         sig = privkey.ecdsa_sign(plugin_hash)
-        value = sig.hex()
-        self.config.set_key(f'plugins.{name}.authorized', value)
+        self.config.set_key(f'plugins.{name}.authorized', sig.hex())
+
+    def authorize_plugin(self, name: str, privkey: ECPrivkey):
+        self._sign_plugin_hash(name, privkey)
         self.config.set_key(f'plugins.{name}.enabled', True)
+
+    def upgrade_external_plugin(self, manifest: dict, privkey: ECPrivkey) -> None:
+        """Replaces the zip of an installed external plugin with the one described
+        by `manifest` (as returned by read_manifest), and signs it.
+
+        This does not go through uninstall(): the 'plugins.<name>' config subtree is
+        kept, and so is the plugin's wallet data (see WalletDB.prune_uninstalled_plugin_data).
+        The client must be restarted: we cannot undo the side effects of the old
+        code, which is imported on startup if the plugin is enabled. Until then,
+        the old code keeps running from memory.
+        """
+        name = manifest['name']
+        assert self.is_external(name) and self.is_plugin_zip(name), name
+        if not self._is_version_compatible(manifest):
+            raise Exception(f"plugin {name!r} is not compatible with Electrum {ELECTRUM_VERSION}")
+        # the bytes we write are the bytes whose hash the user was shown
+        blob = self._read_check_bytes(manifest['path'], expected_hash=bytes.fromhex(manifest['zip_hash_sha256']))
+        path = self.zip_plugin_path(name)
+        tmp_path = path + '.part'  # ignored by find_zip_plugins
+        with open(tmp_path, 'wb') as f:
+            f.write(blob)
+            f.flush()
+            os.fsync(f.fileno())
+        # if we stop between these two steps, the plugin is merely unauthorized
+        os.replace(tmp_path, path)
+        self.external_plugin_metadata[name] = dict(manifest, path=path)
+        self._sign_plugin_hash(name, privkey)
 
     def enable(self, name: str) -> 'BasePlugin':
         self.config.enable_plugin(name)

@@ -283,6 +283,16 @@ class PluginsDialog(WindowModalDialog, MessageBoxMixin):
         filename, __ = QFileDialog.getOpenFileName(self, _("Select your plugin zipfile"), "", "*.zip")
         if not filename:
             return
+        try:
+            manifest = self.plugins.read_manifest(filename)
+            name = manifest['name']
+        except Exception as e:
+            self._logger.exception("")
+            self.show_error(f"{e}")
+            return
+        if self.plugins.is_external(name):
+            self.upgrade_plugin(manifest)
+            return
         plugins_dir = self.plugins.get_external_plugin_dir()
         path = os.path.join(plugins_dir, os.path.basename(filename))
         if os.path.exists(path):
@@ -327,6 +337,29 @@ class PluginsDialog(WindowModalDialog, MessageBoxMixin):
             self.gui_object.reload_windows()
         self.show_list()
         return True
+
+    def upgrade_plugin(self, manifest: dict):
+        name = manifest['name']
+        old_version = self.plugins.get_metadata(name).get('version', '?')
+        new_version = manifest.get('version', '?')
+        msg = '\n\n'.join([
+            _('Upgrade plugin {} from version {} to version {}?').format(
+                manifest.get('fullname', name), old_version, new_version),
+            'Hash [sha256]: ' + insert_spaces(manifest['zip_hash_sha256'], 8),
+        ])
+        if not self.question(msg):
+            return
+        privkey = self.get_plugins_privkey()
+        if not privkey:
+            return
+        try:
+            self.plugins.upgrade_external_plugin(manifest, privkey)
+        except Exception as e:
+            self._logger.exception("")
+            self.show_error(f"{e}")
+            return
+        self.show_message(_('Please restart Electrum to use the new version.'))
+        self.show_list()
 
     def maybe_set_icon(self, label, name, icon_path):
         try:
